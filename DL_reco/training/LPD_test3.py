@@ -1,0 +1,340 @@
+### Post-processing image enhancement with Filtered Back Projection using UNet
+###
+### Author: Antti Sällinen
+### Date: July 2023
+###
+### This script is designed to take in an images (preferrably CT-scans),
+### using radon transform to get the sinograms of those images, adding noise
+### to those sinograms and then with filtered back projection (FBP)
+### reconstructing those images. FBP does not perform very well under some
+### noise so deep learning approach is suitable. Known architecture UNet is
+### used to train neural network to enhance the noisy image which FBP produces.
+### UNet that is used is thre layers deep.
+###
+### Needed packages: -odl
+###                  -PyTorch
+###                  -NumPy
+###                  -matplotlib
+###                  -UNet_functions.py (NEEDS ITS OWN PACKAGES EG. OpenCV)
+###
+
+
+### Importing packages and modules
+import odl
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from odl.contrib.torch import OperatorModule
+#from odl.contrib import torch as odl_torch
+#from torch.nn.utils import clip_grad_norm_
+import numpy as np
+from LPD_test_functions3 import get_images, geometry_and_ray_trafo, LPD_step, LPD
+import matplotlib.pyplot as plt
+
+### Check if nvidia CUDA is available and using it, if not, the CPU
+device = 'cpu' #'cuda' if torch.cuda.is_available() else 'cpu'
+
+### Using function "get_images" to import images from the path.
+images = get_images('/scratch2/antti/summer2023/usable_walnuts', amount_of_images=10, scale_number=2)
+### Converting images such that they can be used in calculations
+images = np.array(images, dtype='float32')
+images = torch.from_numpy(images).float().to(device)
+
+### Using functions from "UNet_functions". Taking shape from images to produce
+### odl parameters and getting Radon transform operator and its adjoint.
+shape = (np.shape(images)[1], np.shape(images)[2])
+domain, geometry, ray_transform, output_shape = geometry_and_ray_trafo(setup='full', shape=shape, device=device, factor_lines = 2)
+# =============================================================================
+# print('domain', domain.shape)
+# print('geometry', geometry.translation)
+# print('ray', ray_transform.range)
+# print('output', output_shape)
+# =============================================================================
+
+fbp_operator = odl.tomo.analytic.filtered_back_projection.fbp_op(ray_transform, padding=1)
+
+operator_norm = odl.power_method_opnorm(ray_transform)
+
+# ray_transform = (1/operator_norm) * ray_transform
+
+### Using odl functions to make odl operators into PyTorch modules
+ray_transform_module = OperatorModule(ray_transform).to(device)
+adjoint_operator_module = OperatorModule(ray_transform.adjoint).to(device)
+fbp_operator_module = OperatorModule(fbp_operator).to(device)
+
+### Making sinograms from the images using Radon transform module
+sinograms = ray_transform_module(images)
+
+### Allocating used tensors
+noisy_sinograms = torch.zeros((sinograms.shape[0], ) + output_shape)
+rec_images = torch.zeros((sinograms.shape[0], ) + shape)
+
+### Defining variables which define the amount of training and testing data
+### being used. The training_scale is between 0 and 1 and controls how much
+### training data is taken from whole data
+training_scale = 1
+amount_of_data = sinograms.shape[0]
+n_train = int(np.floor(training_scale * amount_of_data))
+n_test = int(np.floor(amount_of_data - n_train))
+
+mean = 0
+variance = 0.002
+sigma = variance ** 0.5
+percentage = 0.05
+
+### Adding Gaussian noise to the sinograms. Here some problem solving is
+### needed to make this smoother.
+for k in range(np.shape(sinograms)[0]):
+    #coeff = np.max(np.max(sinograms[k,:,:].cpu().detach().numpy()))
+    # mean = 0.000005 #* coeff
+    # variance = 0.000001 #* coeff
+    # sigma = variance ** 0.5
+    sinogram_k = sinograms[k,:,:].cpu().detach().numpy()
+    noise = np.random.normal(mean, sinogram_k.std(), sinogram_k.shape) * percentage
+    noisy_sinogram = sinogram_k + noise
+    # noisy_sinogram = sinograms[k,:,:].cpu().detach().numpy() + np.random.normal(mean, sigma, size=(sinograms.shape[1], sinograms.shape[2]))
+    noisy_sinograms[k,:,:] = torch.as_tensor(noisy_sinogram)
+
+### Using FBP to get reconstructed images from noisy sinograms
+rec_images = fbp_operator_module(noisy_sinograms.to(device))
+
+### All the data into same device
+sinograms = sinograms[:,None,:,:].cpu().detach()
+noisy_sinograms = noisy_sinograms[:,None,:,:].cpu().detach()
+rec_images = rec_images[:,None,:,:].cpu().detach()
+images = images[:,None,:,:].cpu().detach()
+
+### Seperating the data into training and and testing data. 
+### "g_" is data from reconstructed images and
+### "f_" is data from ground truth images
+# =============================================================================
+# g_train_sinos = noisy_sinograms[0:n_train]
+# g_train = rec_images[0:n_train]
+# #g_test = rec_images[n_train:n_train+n_test]
+# f_train_sinos = sinograms[0:n_train]
+# f_train = rec_images[0:n_train]
+# #f_test = images[n_train:n_train+n_test]
+# print('g_train', g_train.shape)
+# print('f_train', f_train.shape)
+# print('shape', ray_transform_module(f_train).shape)
+# =============================================================================
+
+f_images = images[0:n_train]
+print('f_images', f_images.shape)
+g_sinograms = noisy_sinograms[0:n_train]
+f_rec_images = rec_images[0:n_train]
+
+test_images = get_images('/scratch2/antti/summer2023/test_walnut', amount_of_images='all', scale_number=2)
+# print('tetst images', test_images.shape)
+test_images = np.array(test_images, dtype='float32')
+test_images = torch.from_numpy(test_images).float().to(device)
+
+test_sinograms = ray_transform_module(test_images)
+
+list_of_test_images = list(range(0,363,5))
+
+test_noisy_sinograms = torch.zeros((test_sinograms.shape[0], ) + output_shape)
+test_rec_images = torch.zeros((test_sinograms.shape[0], ) + shape)
+
+for k in range(np.shape(test_sinograms)[0]):
+    #coeff = np.max(np.max(sinograms[k,:,:].cpu().detach().numpy()))
+    # mean = 0.005 #* coeff
+    # variance = 0.001 #* coeff
+    # sigma = variance ** 0.5
+    test_sinogram_k = test_sinograms[k,:,:].cpu().detach().numpy()
+    noise = np.random.normal(mean, test_sinogram_k.std(), test_sinogram_k.shape) * percentage
+    test_noisy_sinogram = test_sinogram_k + noise
+    # test_noisy_sinogram = test_sinograms[k,:,:].cpu().detach().numpy() + np.random.normal(mean, sigma, size=(test_sinograms.shape[1], test_sinograms.shape[2]))
+    test_noisy_sinograms[k,:,:] = torch.as_tensor(test_noisy_sinogram)
+                                                  
+    
+test_rec_images = fbp_operator_module(test_noisy_sinograms)
+    
+test_sinograms = test_sinograms[:,None,:,:].to(device)
+test_noisy_sinograms = test_noisy_sinograms[:,None,:,:].to(device)
+test_rec_images = test_rec_images[:,None,:,:].to(device)
+test_images = test_images[:,None,:,:].to(device)
+
+print(test_rec_images.shape)
+print(test_images.shape)
+
+# indices = np.random.permutation(test_rec_images.shape[0])[:75]
+f_test_images = test_images[list_of_test_images]
+g_test_sinograms = test_noisy_sinograms[list_of_test_images]
+f_test_rec_images = test_rec_images[list_of_test_images]
+
+### Plotting one image from all and its sinogram and noisy sinogram
+# image_number = 50
+# noisy_sino = noisy_sinograms[image_number,0,:,:].cpu().detach().numpy()
+# orig_sino = sinograms[image_number,0,:,:].cpu().detach().numpy()
+# orig = rec_images[image_number,0,:,:].cpu().detach().numpy()
+
+# plt.figure()
+# plt.subplot(1,3,1)
+# plt.imshow(orig)
+# plt.subplot(1,3,2)
+# plt.imshow(noisy_sino)
+# plt.subplot(1,3,3)
+# plt.imshow(orig_sino)
+# plt.show()
+
+image_number = 25
+noisy_sino = test_noisy_sinograms[image_number,0,:,:].cpu().detach().numpy()
+orig_sino = test_sinograms[image_number,0,:,:].cpu().detach().numpy()
+orig = test_rec_images[image_number,0,:,:].cpu().detach().numpy()
+
+plt.figure()
+plt.subplot(1,3,1)
+plt.imshow(orig)
+plt.subplot(1,3,2)
+plt.imshow(noisy_sino)
+plt.subplot(1,3,3)
+plt.imshow(orig_sino)
+plt.show()
+
+
+
+loss_train = nn.MSELoss()
+loss_test = nn.MSELoss()
+
+def psnr(loss):
+    
+    psnr = 10 * np.log10(1.0 / loss+1e-10)
+    
+    return psnr
+
+### Setting up some lists used later
+running_loss = []
+running_test_loss = []
+
+LPD_network = LPD(ray_transform_module, adjoint_operator_module, operator_norm, n_iter=10, device=device)
+
+n_train = 50001
+batch_size = 1
+
+optimizer = optim.Adam(LPD_network.parameters(), lr=0.001, betas=(0.9, 0.99)) #betas = (0.9, 0.99)
+
+### Definign scheduler, can be used if wanted
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, n_train)
+
+for k in range(n_train):
+    
+    LPD_network.train()
+
+    n_index = np.random.permutation(g_sinograms.shape[0])[:batch_size]
+    g_batch = g_sinograms[n_index,:,:,:].to(device)
+    f_batch = f_images[n_index].to(device)
+    f_batch2 = f_rec_images[n_index].to(device)
+    
+    LPD_network.train()
+    
+    optimizer.zero_grad()
+    
+    ### Taking out some enhanced images
+    outs = LPD_network(f_batch2, g_batch)
+    
+    # net.train()
+    
+    ### Setting gradient to zero
+    # optimizer.zero_grad()
+    
+    ### Calculating loss of the outputs
+    loss = loss_train(f_batch, outs)
+    
+    ### Calculating gradient
+    loss.backward()
+    
+    ### Here gradient clipping could be used
+    torch.nn.utils.clip_grad_norm_(LPD_network.parameters(), max_norm=1.0, norm_type=2)
+    
+    ### Taking optimizer step
+    optimizer.step()
+    scheduler.step()
+    
+    # del g_batch, f_batch, f_batch2
+
+    ### Here starts the running tests
+    if k % 100 == 0:
+        
+        ### Using predetermined test data to see how the outputs are
+        ### in our neural network
+        LPD_network.train()
+        with torch.no_grad():
+            outs2 = LPD_network(f_test_rec_images, g_test_sinograms)
+        # print('outs2', outs2.shape)
+        ### Calculating test loss with test data outputs
+            test_loss = loss_test(f_test_images, outs2).item()**0.5
+        train_loss = loss.item() ** 0.5
+        running_loss.append(train_loss)
+        running_test_loss.append(test_loss)
+        
+        ### Printing some data out
+        if k % 500 == 0:
+            print(f'Iter {k}/{n_train} Train Loss: {train_loss:.2e}, Test Loss: {test_loss:.2e}, PSNR: {psnr(test_loss**2):.2f}') #, end='\r'
+            # print(f'Step lenght: {step_len[0]}')
+            plt.figure()
+            plt.subplot(1,2,1)
+            plt.imshow(outs2[54,0,:,:].cpu().detach().numpy())
+            plt.subplot(1,2,2)
+            plt.imshow(f_test_images[0,0,:,:].cpu().detach().numpy())
+            plt.show()
+            
+### After iterating taking one reconstructed image and its ground truth
+### and showing them
+plt.figure()
+plt.subplot(1,2,1)
+plt.imshow(outs[0,0,:,:].cpu().detach().numpy())
+plt.subplot(1,2,2)
+plt.imshow(f_batch[0,0,:,:].cpu().detach().numpy())
+plt.show()
+
+### Plotting running loss and running test loss
+plt.figure()
+plt.semilogy(running_loss)
+plt.semilogy(running_test_loss)
+plt.show()
+    
+
+### Evaluating the network
+# out3, _ = eval(ready_to_eval, loss_function, f_test_images, g_test_sinograms, f_test_rec_images)
+print('f test images', f_test_images.shape)
+print('g_test_sinos', g_test_sinograms.shape)
+print('f test rec images', f_test_rec_images.shape)
+
+LPD_network.eval()
+### Taking images and plotting them to show how the neural network does succeed
+image_number = int(np.random.randint(g_test_sinograms.shape[0], size=1))
+# print('ASD', f_test_rec_images[None,image_number,:,:].shape)
+# print('asd', g_test_sinograms[None,image_number,:,:].shape)
+LGD_reconstruction = LPD_network(f_test_rec_images[None,image_number,:,:,:], g_test_sinograms[None,image_number,:,:,:])
+LGD_reconstruction = LGD_reconstruction[0,0,:,:].cpu().detach().numpy()
+ground_truth = f_test_images[image_number,0,:,:].cpu().detach().numpy()
+noisy_reconstruction = f_test_rec_images[image_number,0,:,:].cpu().detach().numpy()
+
+plt.figure()
+plt.subplot(1,3,1)
+plt.imshow(noisy_reconstruction)
+plt.subplot(1,3,2)
+plt.imshow(LGD_reconstruction)
+plt.subplot(1,3,3)
+plt.imshow(ground_truth)
+plt.show()
+
+torch.save(LPD_network.state_dict(), '/scratch2/antti/networks/'+'LPD1_005.pth')
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
