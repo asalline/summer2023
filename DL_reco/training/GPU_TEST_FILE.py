@@ -1,4 +1,4 @@
-### Post-processing image enhancement with Filtered Back Projection using UNet
+### Post-processing image denoising with Filtered Back Projection using UNet
 ###
 ### Author: Antti Sällinen
 ### Date: July 2023
